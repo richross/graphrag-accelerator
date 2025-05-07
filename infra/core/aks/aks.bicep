@@ -53,6 +53,15 @@ param privateDnsZoneName string
 @description('Array of object ids of admins that will have admin control over the cluster')
 param clusterAdmins array = []
 
+@description('Resource ID of the User-Assigned Managed Identity for the AKS control plane.')
+param controlPlaneUserAssignedIdentityId string
+
+@description('Resource ID of the User-Assigned Managed Identity for the AKS kubelet.')
+param kubeletUserAssignedIdentityId string
+
+@description('Resource ID of the User-Assigned Managed Identity for the AKS ingress.')
+param ingressUserAssignedIdentityId string
+
 resource privateDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' existing = {
   name: privateDnsZoneName
 }
@@ -61,7 +70,12 @@ resource aks 'Microsoft.ContainerService/managedClusters@2024-09-02-preview' = {
   name: clusterName
   location: location
   identity: {
-    type: 'SystemAssigned'
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${controlPlaneUserAssignedIdentityId}': {}
+      '${kubeletUserAssignedIdentityId}': {}
+      '${ingressUserAssignedIdentityId}': {}
+    }
   }
   properties: {
     enableRBAC: true
@@ -77,6 +91,12 @@ resource aks 'Microsoft.ContainerService/managedClusters@2024-09-02-preview' = {
         enabled: true
         config: {
           logAnalyticsWorkspaceResourceID: logAnalyticsWorkspaceId
+        }
+      }
+      ingressApplicationGateway: {
+        enabled: true
+        config: {
+          userAssignedIdentityID: ingressUserAssignedIdentityId
         }
       }
     }
@@ -97,6 +117,12 @@ resource aks 'Microsoft.ContainerService/managedClusters@2024-09-02-preview' = {
         enableEncryptionAtHost: enableEncryptionAtHost
         vnetSubnetID: subnetId
         type: 'VirtualMachineScaleSets'
+        identity: {
+          type: 'UserAssigned'
+          userAssignedIdentities: [
+            kubeletUserAssignedIdentityId
+          ]
+        }
       }
     ]
     autoScalerProfile: {
@@ -217,7 +243,7 @@ output name string = aks.name
 output id string = aks.id
 output managedResourceGroup string = aks.properties.nodeResourceGroup
 output controlPlaneFqdn string = aks.properties.fqdn
-output kubeletPrincipalId string = aks.properties.identityProfile.kubeletidentity.objectId
-output ingressWebAppIdentity string = aks.properties.ingressProfile.webAppRouting.identity.objectId
-output systemIdentity string = aks.identity.principalId
+output kubeletPrincipalId string = kubeletUserAssignedIdentityId
+output ingressWebAppIdentity string = ingressUserAssignedIdentityId
+output systemIdentity string = controlPlaneUserAssignedIdentityId
 output issuer string = aks.properties.oidcIssuerProfile.issuerURL

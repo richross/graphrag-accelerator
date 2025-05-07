@@ -123,6 +123,10 @@ var workloadIdentitySubject = 'system:serviceaccount:${aksNamespace}:${aksServic
 var dnsDomain = 'graphrag.io'
 var appHostname = 'graphrag.${dnsDomain}'
 var appUrl = 'http://${appHostname}'
+
+var aksControlPlaneIdentityName = '${abbrs.managedIdentityUserAssignedIdentities}${resourceBaseNameFinal}-akscp'
+var aksKubeletIdentityName = '${abbrs.managedIdentityUserAssignedIdentities}${resourceBaseNameFinal}-akskubelet'
+var aksIngressIdentityName = '${abbrs.managedIdentityUserAssignedIdentities}${resourceBaseNameFinal}-aksingress'
 //
 // end AKS parameters
 //
@@ -176,17 +180,17 @@ module aksRBAC 'core/rbac/aks-rbac.bicep' = {
   params: {
     roleAssignments: [
       {
-        principalId: aks.outputs.kubeletPrincipalId
+        principalId: aksKubeletIdentity.outputs.principalId
         principalType: 'ServicePrincipal'
         roleDefinitionId: roles.acrPull
       }
       {
-        principalId: aks.outputs.ingressWebAppIdentity
+        principalId: aksIngressIdentity.outputs.principalId
         principalType: 'ServicePrincipal'
         roleDefinitionId: roles.privateDnsZoneContributor
       }
       {
-        principalId: aks.outputs.systemIdentity
+        principalId: aksControlPlaneIdentity.outputs.principalId
         principalType: 'ServicePrincipal'
         roleDefinitionId: roles.networkContributor
       }
@@ -257,6 +261,20 @@ module aks 'core/aks/aks.bicep' = {
     logAnalyticsWorkspaceId: log.outputs.id
     subnetId: vnet.outputs.aksSubnetId
     privateDnsZoneName: privateDnsZone.outputs.name
+    controlPlaneUserAssignedIdentityId: aksControlPlaneIdentity.outputs.id
+    kubeletUserAssignedIdentityId: aksKubeletIdentity.outputs.id
+    ingressUserAssignedIdentityId: aksIngressIdentity.outputs.id // Assuming an ingress controller will use this
+  }
+}
+
+var cosmosDbIdentityName = '${abbrs.managedIdentityUserAssignedIdentities}${resourceBaseNameFinal}-cosmosdb'
+
+// Create a User-Assigned Managed Identity for CosmosDB
+module cosmosDbIdentity 'core/identity/identity.bicep' = {
+  name: 'cosmosdb-identity-deployment'
+  params: {
+    name: cosmosDbIdentityName
+    location: location
   }
 }
 
@@ -266,6 +284,7 @@ module cosmosdb 'core/cosmosdb/cosmosdb.bicep' = {
     cosmosDbName: '${abbrs.documentDBDatabaseAccounts}${resourceBaseNameFinal}'
     location: location
     publicNetworkAccess: enablePrivateEndpoints ? 'Disabled' : 'Enabled'
+    userAssignedIdentityId: cosmosDbIdentity.outputs.id
   }
 }
 
@@ -350,6 +369,30 @@ module workloadIdentity 'core/identity/identity.bicep' = {
         subject: workloadIdentitySubject
       }
     }
+  }
+}
+
+module aksControlPlaneIdentity 'core/identity/identity.bicep' = {
+  name: 'aks-control-plane-identity-deployment'
+  params: {
+    name: aksControlPlaneIdentityName
+    location: location
+  }
+}
+
+module aksKubeletIdentity 'core/identity/identity.bicep' = {
+  name: 'aks-kubelet-identity-deployment'
+  params: {
+    name: aksKubeletIdentityName
+    location: location
+  }
+}
+
+module aksIngressIdentity 'core/identity/identity.bicep' = {
+  name: 'aks-ingress-identity-deployment'
+  params: {
+    name: aksIngressIdentityName
+    location: location
   }
 }
 

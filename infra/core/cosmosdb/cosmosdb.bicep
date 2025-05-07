@@ -1,28 +1,35 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-@description('The name of the CosmosDB resource.')
+@description('The name of the CosmosDB account.')
 param cosmosDbName string
 
-@description('The location of the CosmosDB resource.')
+@description('The location of the CosmosDB account.')
 param location string = resourceGroup().location
 
+@description('Whether public network access is enabled or disabled.')
 @allowed(['Enabled', 'Disabled'])
 param publicNetworkAccess string = 'Disabled'
 
+@description('Resource ID of the User-Assigned Managed Identity for CosmosDB.')
+param userAssignedIdentityId string
+
 var maxThroughput = 1000
 
-resource cosmosDb 'Microsoft.DocumentDB/databaseAccounts@2024-11-15' = {
+resource cosmosDbAccount 'Microsoft.DocumentDB/databaseAccounts@2024-11-15' = {
   name: cosmosDbName
   location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${userAssignedIdentityId}': {}
+    }
+  }
   tags: {
     defaultExperience: 'Core (SQL)'
     'hidden-cosmos-mmspecial': ''
   }
   kind: 'GlobalDocumentDB'
-  identity: {
-    type: 'SystemAssigned'
-  }
   properties: {
     publicNetworkAccess: publicNetworkAccess
     enableAutomaticFailover: false
@@ -75,7 +82,7 @@ resource cosmosDb 'Microsoft.DocumentDB/databaseAccounts@2024-11-15' = {
 // NOTE: The current CosmosDB role assignments are not sufficient to allow the aks workload identity to create databases and containers so we must do it in bicep at deployment time.
 // TODO: Identify and assign appropriate RBAC roles that allow the workload identity to create new databases and containers instead of relying on this bicep implementation.
 resource graphragDatabase 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases@2024-11-15' = {
-  parent: cosmosDb
+  parent: cosmosDbAccount
   name: 'graphrag'
   properties: {
     options: {
@@ -165,6 +172,6 @@ resource containerStoreContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatab
   }
 }
 
-output name string = cosmosDb.name
-output id string = cosmosDb.id
-output endpoint string = cosmosDb.properties.documentEndpoint
+output id string = cosmosDbAccount.id
+output name string = cosmosDbAccount.name
+output endpoint string = cosmosDbAccount.properties.documentEndpoint
