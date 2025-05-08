@@ -29,6 +29,7 @@ GRAPHRAG_EMBEDDING_MODEL="text-embedding-ada-002"
 GRAPHRAG_EMBEDDING_MODEL_VERSION="2"
 GRAPHRAG_EMBEDDING_DEPLOYMENT_NAME="text-embedding-ada-002"
 GRAPHRAG_EMBEDDING_MODEL_QUOTA="300"
+MODE=""
 
 requiredParams=(
     LOCATION
@@ -730,9 +731,11 @@ deployDockerImageToInternalACR() {
 ################################################################################
 usage() {
    echo
-   echo "Usage: bash $0 [-h|d|g|s] -p <deploy.parameters.json>"
+   echo "Usage: bash $0 [--owner|--contrib] [-h|d|g|s] -p <deploy.parameters.json>"
    echo "Description: Deployment script for the GraphRAG Solution Accelerator."
    echo "options:"
+   echo "  --owner  Run only Owner-level Azure resource deployment (main-owner.bicep)." # New option
+   echo "  --contrib Run only Contributor-level Azure resource deployment (main-contrib.bicep) and subsequent steps." # New option
    echo "  -h     Print this help menu."
    echo "  -d     Disable private endpoint usage."
    echo "  -g     Developer mode. Grants deployer of this script access to Azure Storage, AI Search, and CosmosDB. Will disable private endpoints (-d) and enable debug mode."
@@ -768,6 +771,19 @@ while getopts ":dgsp:h" option; do
             ;;
     esac
 done
+# Parse --owner and --contrib flags
+for arg in "$@"; do
+  case $arg in
+    --owner)
+      MODE="owner"
+      shift # Remove --owner from processing
+      ;;
+    --contrib)
+      MODE="contrib"
+      shift # Remove --contrib from processing
+      ;;
+  esac
+done
 shift $((OPTIND-1))
 # check if required arguments are supplied
 if [ ! -f $PARAMS_FILE ]; then
@@ -775,39 +791,165 @@ if [ ! -f $PARAMS_FILE ]; then
     usage
     exit 1
 fi
+
+# Ensure a mode is specified (assuming MODE is set by your parsing logic)
+if [[ -z "$MODE" ]]; then
+    echo "Error: Deployment mode --owner or --contrib must be specified."
+    usage
+    exit 1
+fi
+
 ################################################################################
 # Main Program                                                                 #
 ################################################################################
 startBanner
 
 checkRequiredTools
-populateParams $PARAMS_FILE
+populateParams $PARAMS_FILE # Reads PARAMS_FILE into environment variables
 
-# Check SKU availability and quotas
-validateSKUs $LOCATION $VALIDATE_SKUS_FLAG
+validateSKUs $LOCATION $VALIDATE_SKUS_FLAG # Uses LOCATION from PARAMS_FILE
+createResourceGroupIfNotExists $LOCATION $RESOURCE_GROUP # Uses LOCATION, RESOURCE_GROUP
 
-# Create resource group
-createResourceGroupIfNotExists $LOCATION $RESOURCE_GROUP
+checkForApimSoftDelete # Uses RESOURCE_GROUP
 
-# Deploy Azure resources
-checkForApimSoftDelete
-deployAzureResources
+# --- BEGIN MODIFIED DEPLOYMENT LOGIC ---
+if [[ "$MODE" == "owner" ]]; then
+    echo "Starting Owner deployment..."
+    local datetime_owner deployName_owner AZURE_DEPLOY_RESULTS_OWNER AZURE_OWNER_OUTPUTS
+    datetime_owner="`date +%Y-%m-%d_%H-%M-%S`"
+    deployName_owner="graphrag-owner-deploy-$datetime_owner"
+    echo "Owner Deployment name: $deployName_owner"
 
-# Deploy graphrag docker image to internal ACR if an external ACR was not provided
-if [ -z "$CONTAINER_REGISTRY_LOGIN_SERVER" ]; then
-    deployDockerImageToInternalACR
+    # Parameters for main-owner.bicep should be sourced from $PARAMS_FILE / env vars
+    # Ensure all required parameters for main-owner.bicep are available
+    AZURE_DEPLOY_RESULTS_OWNER=$(az deployment group create --name "$deployName_owner" \
+        --no-prompt \
+        --resource-group "$RESOURCE_GROUP" \
+        --template-file ./main-owner.bicep \
+        --parameters "resourceGroupName=$RESOURCE_GROUP" \
+        --parameters "resourceBaseName=$RESOURCE_BASE_NAME" \
+        --parameters "location=$LOCATION" \
+        --parameters "apiPublisherName=$PUBLISHER_NAME" \
+        --parameters "apiPublisherEmail=$PUBLISHER_EMAIL" \
+        --parameters "apimTier=$APIM_TIER" \
+        --parameters "enablePrivateEndpoints=$ENABLE_PRIVATE_ENDPOINTS" \
+        # Add any other parameters required by main-owner.bicep
+        --output json)
+    exitIfCommandFailed $? "Error deploying Owner Azure resources..."
+    exitIfValueEmpty "$AZURE_DEPLOY_RESULTS_OWNER" "Error deploying Owner Azure resources..."
+    AZURE_OWNER_OUTPUTS=$(jq -r .properties.outputs <<< "$AZURE_DEPLOY_RESULTS_OWNER")
+    exitIfCommandFailed $? "Error parsing outputs from Owner Azure deployment..."
+    exitIfValueEmpty "$AZURE_OWNER_OUTPUTS" "Error parsing outputs from Owner Azure deployment..."
+
+    echo "Owner deployment completed successfully."
+    # Save outputs to a file using the Python script
+    python3 ./manage_bicep_outputs.py save "$AZURE_OWNER_OUTPUTS" "owner-outputs.json"
+    exitIfCommandFailed $? "Error saving owner outputs to owner-outputs.json"
+
+    echo "Outputs from Owner deployment saved to owner-outputs.json. Contents:"
+    jq . < owner-outputs.json
+    # Consider saving $AZURE_OWNER_OUTPUTS to a file for handoff, e.g., owner-outputs.json
+
+elif [[ "$MODE" == "contrib" ]]; then
+    echo "Starting Contributor deployment..."
+    # Load owner outputs as environment variables
+    echo "Loading outputs from owner-outputs.json into environment variables..."
+    if [ ! -f "owner-outputs.json" ]; then
+        echo "Error: owner-outputs.json not found. Please run the --owner mode first and ensure owner-outputs.json is present."
+        exit 1
+    fi
+    eval $(python3 ./manage_bicep_outputs.py load-env "owner-outputs.json")
+    exitIfCommandFailed $? "Error loading owner outputs from owner-outputs.json"
+    echo "Owner outputs loaded into environment variables."
+
+    # Setup parameters for main-contrib.bicep (similar to original deployAzureResources)
+    local deployAoai existingAoaiId="" deployAcr graphragImageName graphragImageVersion
+    deployAoai="true"
+    if [ -n "$GRAPHRAG_API_BASE" ]; then
+        deployAoai="false"
+        existingAoaiId=$(az cognitiveservices account list --query "[?contains(properties.endpoint, '$GRAPHRAG_API_BASE')].id" -o tsv)
+        exitIfValueEmpty "$existingAoaiId" "Unable to get AOAI resource id from GRAPHRAG_API_BASE, exiting..."
+    fi
+    deployAcr="true"
+    if [ -n "$CONTAINER_REGISTRY_LOGIN_SERVER" ]; then
+        deployAcr="false"
+    fi
+    graphragImageName=$(sed -rn "s/([^:]+).*/\1/p" <<< "$GRAPHRAG_IMAGE")
+    graphragImageVersion=$(sed -rn "s/[^:]+:(.*)/\1/p" <<< "$GRAPHRAG_IMAGE")
+    exitIfValueEmpty "$graphragImageName" "Unable to parse graphrag docker image name, exiting..."
+    exitIfValueEmpty "$graphragImageVersion" "Unable to parse graphrag docker image version, exiting..."
+
+    local datetime_contrib deployName_contrib AZURE_DEPLOY_RESULTS_CONTRIB
+    datetime_contrib="`date +%Y-%m-%d_%H-%M-%S`"
+    deployName_contrib="graphrag-contrib-deploy-$datetime_contrib"
+    echo "Contributor Deployment name: $deployName_contrib"
+
+    # Ensure $PARAMS_FILE for contributor mode includes outputs from owner mode
+    # or pass them explicitly. Example:
+    # --parameters "vnetId=$VNET_ID_FROM_OWNER_OUTPUTS" (assuming VNET_ID_FROM_OWNER_OUTPUTS is populated)
+    AZURE_DEPLOY_RESULTS_CONTRIB=$(az deployment group create --name "$deployName_contrib" \
+        --no-prompt \
+        --resource-group "$RESOURCE_GROUP" \
+        --template-file ./main-contrib.bicep \
+        --parameters "resourceGroupName=$RESOURCE_GROUP" \
+        --parameters "resourceBaseName=$RESOURCE_BASE_NAME" \
+        --parameters "location=$LOCATION" \
+        --parameters "apimTier=$APIM_TIER" \
+        --parameters "apiPublisherEmail=$PUBLISHER_EMAIL" \
+        --parameters "apiPublisherName=$PUBLISHER_NAME" \
+        --parameters "enablePrivateEndpoints=$ENABLE_PRIVATE_ENDPOINTS" \
+        --parameters "deployAcr=$deployAcr" \
+        --parameters "existingAcrLoginServer=$CONTAINER_REGISTRY_LOGIN_SERVER" \
+        --parameters "graphragImageName=$graphragImageName" \
+        --parameters "graphragImageVersion=$graphragImageVersion" \
+        --parameters "deployAoai=$deployAoai" \
+        --parameters "existingAoaiId=$existingAoaiId" \
+        --parameters "llmModelName=$GRAPHRAG_LLM_MODEL" \
+        --parameters "llmModelDeploymentName=$GRAPHRAG_LLM_DEPLOYMENT_NAME" \
+        --parameters "llmModelVersion=$GRAPHRAG_LLM_MODEL_VERSION" \
+        --parameters "llmModelQuota=$GRAPHRAG_LLM_MODEL_QUOTA" \
+        --parameters "embeddingModelName=$GRAPHRAG_EMBEDDING_MODEL" \
+        --parameters "embeddingModelDeploymentName=$GRAPHRAG_EMBEDDING_DEPLOYMENT_NAME" \
+        --parameters "embeddingModelVersion=$GRAPHRAG_EMBEDDING_MODEL_VERSION" \
+        --parameters "embeddingModelQuota=$GRAPHRAG_EMBEDDING_MODEL_QUOTA" \
+        --parameters "aksNamespace=$aksNamespace" \
+        # Example of how to use the environment variables loaded from owner-outputs.json:
+        --parameters "vnetId=${OWNER_OUTPUT_VNETID}" \
+        --parameters "aksSubnetId=${OWNER_OUTPUT_AKSSUBNETID}" \
+        --parameters "apimSubnetId=${OWNER_OUTPUT_APIMSUBNETID}" \
+        --parameters "workloadIdentityClientId=${OWNER_OUTPUT_WORKLOADIDENTITYCLIENTID}" \
+        # Add other necessary parameters from owner outputs
+        --output json)
+    exitIfCommandFailed $? "Error deploying Contributor Azure resources..."
+    exitIfValueEmpty "$AZURE_DEPLOY_RESULTS_CONTRIB" "Error deploying Contributor Azure resources..."
+    # AZURE_DEPLOY_OUTPUTS is used by subsequent script functions
+    AZURE_DEPLOY_OUTPUTS=$(jq -r .properties.outputs <<< "$AZURE_DEPLOY_RESULTS_CONTRIB")
+    exitIfCommandFailed $? "Error parsing outputs from Contributor Azure deployment..."
+    exitIfValueEmpty "$AZURE_DEPLOY_OUTPUTS" "Error parsing outputs from Contributor Azure deployment..."
+
+    echo "Contributor Azure resources deployed successfully."
+
+    # Deploy graphrag docker image to internal ACR if an external ACR was not provided
+    if [ -z "$CONTAINER_REGISTRY_LOGIN_SERVER" ]; then
+        deployDockerImageToInternalACR # Uses AZURE_DEPLOY_OUTPUTS
+    fi
+
+    # Retrieve AKS credentials and install GraphRAG helm chart
+    getAksCredentials "$RESOURCE_GROUP" # Uses AZURE_DEPLOY_OUTPUTS
+    installGraphRAGHelmChart # Uses AZURE_DEPLOY_OUTPUTS
+
+    # Import and setup GraphRAG API in APIM
+    deployDnsRecord # Uses AZURE_DEPLOY_OUTPUTS
+    deployGraphragAPI # Uses AZURE_DEPLOY_OUTPUTS
+
+    if [ "$GRANT_DEV_ACCESS" -eq 1 ]; then
+        grantDevAccessToAzureResources # Uses AZURE_DEPLOY_OUTPUTS
+    fi
+else
+    echo "Error: Invalid mode '$MODE' specified. Use --owner or --contrib."
+    usage
+    exit 1
 fi
-
-# Retrieve AKS credentials and install GraphRAG helm chart
-getAksCredentials $RESOURCE_GROUP
-installGraphRAGHelmChart
-
-# Import and setup GraphRAG API in APIM
-deployDnsRecord
-deployGraphragAPI
-
-if [ $GRANT_DEV_ACCESS -eq 1 ]; then
-    grantDevAccessToAzureResources
-fi
+# --- END MODIFIED DEPLOYMENT LOGIC ---
 
 successBanner

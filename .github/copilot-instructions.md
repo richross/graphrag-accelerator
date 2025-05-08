@@ -15,3 +15,5 @@ The infra structure is the current focus of the enhancements to this project.
     This will be the bulk of conversation related to this repository.
     Only User-Assigned Managed Identities (UAMI) can be used for this deployment. Some portions of the bicep files create UAMI while there are services created with System-Assigned Managed Identities (SAMI).
     As part of this process, there may need to be handoffs between the Owner and Contributor roles to complete the task.
+
+    For the deploy.sh, DO NOT make changes to this file unless specifically directed by the user. This file is too large and about 80% of it is removed when an edit is performed directlon the code.
